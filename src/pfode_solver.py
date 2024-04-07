@@ -12,6 +12,14 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision
 
+def append_dims(x, target_dims):
+    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
+    dims_to_append = target_dims - x.ndim
+    if dims_to_append < 0:
+        raise ValueError(
+            f"input has {x.ndim} dims but target_dims is {target_dims}, which is less"
+        )
+    return x[(...,) + (None,) * dims_to_append]
 
 class PFODESolver():
     def __init__(self, scheduler, t_initial=1, t_terminal=0,) -> None:
@@ -43,42 +51,51 @@ class PFODESolver():
               t_end, 
               prompt_embeds, 
               negative_prompt_embeds, 
-              guidance_scale=1.0,
+              added_time_ids,
+              min_guidance_scale=1.0,
+              max_guidance_scale=3.0,
               num_steps = 2,
               num_windows = 1,
+              img_latents=None
     ):
         assert t_start.dim() == 1
-        assert guidance_scale >= 1 and torch.all(torch.gt(t_start, t_end))
+        assert max_guidance_scale >= 1 and torch.all(torch.gt(t_start, t_end))
         
-        do_classifier_free_guidance = True if guidance_scale > 1 else False
-        bsz = latents.shape[0]
-            
+        do_classifier_free_guidance = True if max_guidance_scale > 1 else False
+    
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
             
-        timestep_cond = None
-        if unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(bsz)
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=unet.config.time_cond_proj_dim
-            ).to(device=latents.device, dtype=latents.dtype)
-            
+        # timestep_cond = None
+        # if unet.config.time_cond_proj_dim is not None:
+        #     guidance_scale_tensor = torch.tensor(guidance_scale - 1).repeat(bsz)
+        #     timestep_cond = self.get_guidance_scale_embedding(
+        #         guidance_scale_tensor, embedding_dim=unet.config.time_cond_proj_dim
+        #     ).to(device=latents.device, dtype=latents.dtype)
+    
+        # 7. Prepare guidance scale
+        bsz, num_frames, channels, *_ = latents.shape
+        guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
+        guidance_scale = guidance_scale.to(latents.dtype)
+        guidance_scale = guidance_scale.repeat(bsz, 1)
+        guidance_scale = append_dims(guidance_scale, latents.ndim)
         
         timesteps = self.get_timesteps(t_start, t_end, num_steps).to(device=latents.device)
         timestep_interval = self.scheduler.config.num_train_timesteps // (num_windows * num_steps)
 
         # Denoising loop
         with torch.no_grad():
+            _latents = latents
             for i in range(num_steps):
                 t = torch.cat([timesteps[:, i]]*2) if do_classifier_free_guidance else timesteps[:, i]
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                _latents_cat = torch.cat([_latents, img_latents],dim=2).to(latents.dtype)
+                latent_model_input = torch.cat([_latents_cat] * 2) if do_classifier_free_guidance else _latents_cat
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
                 noise_pred = unet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
+                    added_time_ids=added_time_ids,
                     return_dict=False,
                 )[0]
 
@@ -101,19 +118,19 @@ class PFODESolver():
                 beta_prod_t = beta_prod_t.to(device=latents.device, dtype=latents.dtype)
 
                 if self.scheduler.config.prediction_type == "epsilon":
-                    pred_original_sample = (latents - beta_prod_t[:,None,None,None] ** (0.5) * noise_pred) / alpha_prod_t[:, None,None,None] ** (0.5)
+                    pred_original_sample = (latents - beta_prod_t[:,None,None,None,None] ** (0.5) * noise_pred) / alpha_prod_t[:,None,None,None,None] ** (0.5)
                     pred_epsilon = noise_pred
                 elif self.scheduler.config.prediction_type == "v_prediction":
-                    pred_original_sample = (alpha_prod_t[:,None,None,None]**0.5) * latents - (beta_prod_t[:,None,None,None]**0.5) * noise_pred
-                    pred_epsilon = (alpha_prod_t[:,None,None,None]**0.5) * noise_pred + (beta_prod_t[:,None,None,None]**0.5) * latents
+                    pred_original_sample = (alpha_prod_t[:,None,None,None,None]**0.5) * latents - (beta_prod_t[:,None,None,None,None]**0.5) * noise_pred
+                    pred_epsilon = (alpha_prod_t[:,None,None,None,None]**0.5) * noise_pred + (beta_prod_t[:,None,None,None,None]**0.5) * latents
                 else:
                     raise NotImplementedError
                     
-                pred_sample_direction = (1 - alpha_prod_t_prev[:,None,None,None]) ** (0.5) * pred_epsilon
-                latents = alpha_prod_t_prev[:,None,None,None] ** (0.5) * pred_original_sample + pred_sample_direction
+                pred_sample_direction = (1 - alpha_prod_t_prev[:,None,None,None,None]) ** (0.5) * pred_epsilon
+                _latents = alpha_prod_t_prev[:,None,None,None,None] ** (0.5) * pred_original_sample + pred_sample_direction
 
             
-        return latents
+        return _latents
     
     
     

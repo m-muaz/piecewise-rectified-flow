@@ -168,6 +168,7 @@ class PeRFlowScheduler(SchedulerMixin, ConfigMixin):
         t_noise: float = 1,
         t_clean: float = 0,
         num_time_windows = 4,
+        sigma_data = 1.0,
     ):
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
@@ -213,6 +214,9 @@ class PeRFlowScheduler(SchedulerMixin, ConfigMixin):
             `torch.FloatTensor`:
                 A scaled input sample.
         """
+        # _, _, _, _, gamma_s_e = self.get_window_alpha(timestep)
+        # sigma_s_e = (1 - gamma_s_e**2)**0.5
+        # sample = sample / ((sigma_s_e**2 + self.config.sigma_data**2) ** 0.5)
         return sample
 
 
